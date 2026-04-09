@@ -23,12 +23,25 @@ const VALID_LANGUAGES = new Set(["ar", "en"]);
 const VALID_FEEDBACKS = new Set(["liked", "disliked", null, undefined]);
 const VALID_MODES = new Set(["accurate", "normal"]);
 const VALID_VARIATIONS = new Set([0, 1]);
+const VALID_GOALS = new Set(["professional", "eyecatching", "budget", "identity", null, undefined]);
 const INJECTION_PATTERN = /ignore\s+previous|system\s*:|assistant\s*:|<\s*\/?\s*(system|prompt|instruction)/gi;
+
+const RATE_LIMIT_CLEANUP_MS = 10 * 60 * 1000;
+
+/* ================= SCORE WEIGHTS ================= */
+
+const SCORE_WEIGHTS = {
+  accuracy: 0.6,
+  confidence: 0.4,
+  experienceMax: 30,
+  satisfactionMax: 10,
+} as const;
 
 /* ================= TYPES ================= */
 
 type Language = "ar" | "en";
 type Variation = 0 | 1;
+type StyleGoal = "professional" | "eyecatching" | "budget" | "identity" | null;
 
 interface OutfitPart {
   top: string;
@@ -116,6 +129,15 @@ function sanitizeHistoryEntry(entry: any): any {
   return { occasion, variation, feedback };
 }
 
+function cleanupRateLimit(): void {
+  const now = Date.now();
+  for (const [ip, timestamp] of RATE_LIMIT.entries()) {
+    if (now - timestamp > RATE_LIMIT_CLEANUP_MS) {
+      RATE_LIMIT.delete(ip);
+    }
+  }
+}
+
 /* ================= SIZE ================= */
 
 function getSize(height: number, weight: number) {
@@ -197,6 +219,58 @@ function predictNextStyle(dna: DNA | null, variation: number): Variation {
   return base;
 }
 
+/* ================= GOAL BLOCK ================= */
+
+function buildGoalBlock(goal: StyleGoal, isAr: boolean): string {
+  if (!goal) return "";
+
+  const goalDescriptions: Record<NonNullable<StyleGoal>, { ar: string; en: string }> = {
+    professional: {
+      ar: `هدف المستخدم: الظهور باحترافية في بيئة العمل.
+ركّز على الألوان المحايدة والقصات الهيكلية والأقمشة عالية الجودة.
+تجنب الصيحات العابرة والألوان الصارخة.
+أعطِ الأولوية للوظيفية والنعومة وملاءمة الاجتماعات والمقابلات.`,
+      en: `User Goal: Look professional in a work environment.
+Focus on neutral colors, structured cuts, and high-quality fabrics.
+Avoid fleeting trends and loud colors.
+Prioritize functionality, refinement, and suitability for meetings and interviews.`,
+    },
+    eyecatching: {
+      ar: `هدف المستخدم: الظهور بشكل لافت للنظر على وسائل التواصل الاجتماعي.
+استخدم قطعاً محورية جريئة وتنسيقات ألوان جذابة بصرياً.
+فكّر في كيفية ظهور الإطلالة في الصور.
+لا بأس بالجرأة والتعبيرية وعكس الصيحات الراقية الحديثة.`,
+      en: `User Goal: Stand out visually on social media.
+Use bold statement pieces and visually compelling color combinations.
+Think about how the outfit will photograph.
+Bold, expressive, and high-fashion trend-aware choices are encouraged.`,
+    },
+    budget: {
+      ar: `هدف المستخدم: الأناقة ضمن ميزانية محدودة.
+أعطِ الأولوية للقطع متعددة الاستخدام التي تتناسب مع عدة إطلالات.
+تجنب القطع الفاخرة ذات العلامات التجارية المعروفة.
+ركّز على المظهر الجيد والمقاس المناسب بدلاً من غلاء الثمن.`,
+      en: `User Goal: Look stylish on a limited budget.
+Prioritize versatile pieces that work across multiple looks.
+Avoid luxury brand-specific pieces.
+Focus on looking good through fit and styling rather than price.`,
+    },
+    identity: {
+      ar: `هدف المستخدم: بناء هوية أسلوبية شخصية ثابتة.
+اقترح قطعاً تشكّل أساساً لأسلوب متماسك وليس مجرد إطلالة منفردة.
+ركّز على الاتساق والتعبير الشخصي والخلود بدلاً من الموضة العابرة.
+كل اقتراح يجب أن يساهم في بناء خزانة ملابس متكاملة ومتناسقة.`,
+      en: `User Goal: Build a consistent personal style identity.
+Suggest pieces that form the foundation of a cohesive wardrobe, not just a single outfit.
+Focus on consistency, personal expression, and timelessness over fleeting fashion.
+Every suggestion should contribute to building a complete, harmonious wardrobe.`,
+    },
+  };
+
+  const desc = goalDescriptions[goal];
+  return isAr ? desc.ar : desc.en;
+}
+
 /* ================= PROMPT ================= */
 
 function buildPrompt({
@@ -209,6 +283,7 @@ function buildPrompt({
   variation,
   feedback,
   dna,
+  goal,
 }: any): string {
 
   const isAr = language === "ar";
@@ -323,6 +398,8 @@ Shift your approach based on this data. If dissatisfaction is high, change direc
         : "User disliked the previous suggestion — pivot completely to a meaningfully different direction."
       : "";
 
+  const goalBlock = buildGoalBlock(goal, isAr);
+
   const stylistHierarchy = isAr
     ? `
 تسلسل الأولويات الأسلوبية:
@@ -374,6 +451,8 @@ Occasion: ${occasion}
 Season: ${season}
 Gender: ${gender}
 
+${goalBlock ? (isAr ? `\n--- هدف المستخدم ---\n${goalBlock}\n---\n` : `\n--- USER GOAL ---\n${goalBlock}\n---\n`) : ""}
+
 ${colorHarmony}
 ${fabricLogic}
 ${proportionLogic}
@@ -420,6 +499,10 @@ export async function POST(req: NextRequest) {
     }
     RATE_LIMIT.set(ip, now);
 
+    if (Math.random() < 0.05) {
+      cleanupRateLimit();
+    }
+
     /* BODY */
     let body: any;
     try {
@@ -446,6 +529,10 @@ export async function POST(req: NextRequest) {
     const rawMode = sanitize(body.mode);
     const rawVariation = body.variation;
     const clientSeason = sanitize(body.season);
+
+    /* VALIDATE GOAL */
+    const rawGoal = body.goal ?? null;
+    const goal: StyleGoal = VALID_GOALS.has(rawGoal) ? rawGoal : null;
 
     /* VALIDATE LANGUAGE */
     if (!VALID_LANGUAGES.has(language)) {
@@ -503,6 +590,7 @@ export async function POST(req: NextRequest) {
       variation: evolvedVariation,
       feedback,
       dna,
+      goal,
     });
 
     /* GPT CALL */
@@ -563,14 +651,18 @@ export async function POST(req: NextRequest) {
 
     MEMORY_DB.set(userId, profile);
 
-    /* SCORE — deterministic, bounded, NaN-safe */
-    const experienceBonus = Math.min(dna?.experience || 0, 30);
-    const satisfactionBonus = dna ? Math.round(dna.satisfaction * 10) : 0;
+    /* SCORE */
+    const experienceBonus = Math.min(dna?.experience || 0, SCORE_WEIGHTS.experienceMax);
+    const satisfactionBonus = dna
+      ? Math.round(dna.satisfaction * SCORE_WEIGHTS.satisfactionMax)
+      : 0;
+
     const rawScore =
-      accuracy * 0.6 +
-      confidence * 0.4 +
+      accuracy * SCORE_WEIGHTS.accuracy +
+      confidence * SCORE_WEIGHTS.confidence +
       experienceBonus +
       satisfactionBonus;
+
     const score = clampScore(rawScore);
 
     /* TEXT */

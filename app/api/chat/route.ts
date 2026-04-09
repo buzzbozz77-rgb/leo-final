@@ -13,9 +13,57 @@ const openai = new OpenAI({
 });
 
 /* =========================
-   SYSTEM PROMPT (Optimized)
+   RATE LIMITING
 ========================= */
-const SYSTEM_PROMPT = `
+// ✅ FIX #1: Rate limiting عشان نحمي الـ API من الـ abuse
+// كل IP يقدر يرسل MAX_REQUESTS_PER_WINDOW request كل WINDOW_MS
+const RATE_LIMIT_MAP = new Map<string, { count: number; windowStart: number }>();
+const MAX_REQUESTS_PER_WINDOW = 20;       // أقصى عدد requests
+const WINDOW_MS = 60 * 1000;             // كل دقيقة
+const RATE_LIMIT_CLEANUP_MS = 5 * 60 * 1000; // تنظيف الـ map كل 5 دقائق
+
+function checkRateLimit(ip: string): boolean {
+  const now = Date.now();
+  const entry = RATE_LIMIT_MAP.get(ip);
+
+  // تنظيف دوري بنسبة 5% من الـ requests
+  if (Math.random() < 0.05) {
+    for (const [key, val] of RATE_LIMIT_MAP.entries()) {
+      if (now - val.windowStart > RATE_LIMIT_CLEANUP_MS) {
+        RATE_LIMIT_MAP.delete(key);
+      }
+    }
+  }
+
+  if (!entry || now - entry.windowStart > WINDOW_MS) {
+    // نافذة جديدة
+    RATE_LIMIT_MAP.set(ip, { count: 1, windowStart: now });
+    return true;
+  }
+
+  if (entry.count >= MAX_REQUESTS_PER_WINDOW) {
+    return false; // تجاوز الحد
+  }
+
+  entry.count++;
+  return true;
+}
+
+/* =========================
+   CONSTANTS
+========================= */
+const MAX_MESSAGE_LENGTH = 2000;
+const MAX_HISTORY_MESSAGES = 10;
+const MAX_HISTORY_CONTENT_LENGTH = 1500;
+// ✅ FIX #2: حد إجمالي للـ history عشان ما نرسل كثير للـ API
+const MAX_TOTAL_HISTORY_CHARS = 8000;
+
+/* =========================
+   SYSTEM PROMPT
+========================= */
+// ✅ FIX #3: حولناه لـ function عشان يكون قابل للتخصيص مستقبلاً
+function buildSystemPrompt(): string {
+  return `
 You are LEO, an elite luxury fashion stylist AI.
 
 IDENTITY
@@ -50,7 +98,56 @@ Good: Wear a charcoal wool blazer with navy trousers and a crisp white Oxford sh
 
 You are not giving advice.
 You are delivering a luxury styling experience.
-`;
+`.trim();
+}
+
+/* =========================
+   ERROR MESSAGES
+========================= */
+// ✅ FIX #5: رسائل الخطأ بالعربي والإنجليزي
+const ERROR_MESSAGES = {
+  invalidMessage: {
+    ar: "من فضلك أرسل رسالة صحيحة.",
+    en: "Please provide a valid message.",
+  },
+  rateLimit: {
+    ar: "طلبات كثيرة جداً. انتظر دقيقة وحاول مجدداً.",
+    en: "Too many requests. Please wait a minute and try again.",
+  },
+  noReply: {
+    ar: "تعذر توليد الرد. حاول مجدداً.",
+    en: "Unable to generate response. Please try again.",
+  },
+  auth: {
+    ar: "خطأ في المصادقة.",
+    en: "Authentication error.",
+  },
+  tooManyRequests: {
+    ar: "الخدمة مشغولة. أبطئ قليلاً.",
+    en: "Too many requests. Please slow down.",
+  },
+  serviceUnavailable: {
+    ar: "الخدمة غير متاحة مؤقتاً.",
+    en: "AI service temporarily unavailable.",
+  },
+  network: {
+    ar: "مشكلة في الاتصال بالشبكة.",
+    en: "Network connection issue.",
+  },
+  unexpected: {
+    ar: "خطأ غير متوقع في الخادم.",
+    en: "Unexpected server error.",
+  },
+};
+
+function getErrorMsg(key: keyof typeof ERROR_MESSAGES, lang: "ar" | "en"): string {
+  return ERROR_MESSAGES[key][lang];
+}
+
+function detectLang(message: string): "ar" | "en" {
+  const arabicPattern = /[\u0600-\u06FF]/;
+  return arabicPattern.test(message) ? "ar" : "en";
+}
 
 /* =========================
    REQUEST HANDLER
@@ -60,21 +157,36 @@ export async function POST(req: Request) {
     const body = await req.json();
     const { message, history } = body ?? {};
 
+    // ✅ FIX #5: نكتشف اللغة أول شي عشان نرجع الأخطاء بنفس اللغة
+    const lang = detectLang(typeof message === "string" ? message : "");
+
     /* ---------- INPUT VALIDATION ---------- */
     if (!message || typeof message !== "string" || !message.trim()) {
       return NextResponse.json(
-        { reply: "Please provide a valid message." },
+        { reply: getErrorMsg("invalidMessage", lang) },
         { status: 400 }
       );
     }
 
+    /* ---------- RATE LIMIT ---------- */
+    // ✅ FIX #1: تطبيق الـ rate limiting
+    const ip = req.headers.get("x-forwarded-for")?.split(",")[0]?.trim() || "unknown";
+    if (!checkRateLimit(ip)) {
+      return NextResponse.json(
+        { reply: getErrorMsg("rateLimit", lang) },
+        { status: 429 }
+      );
+    }
+
     /* ---------- SANITIZE ---------- */
-    const sanitizedMessage = message.trim().slice(0, 2000);
+    const sanitizedMessage = message.trim().slice(0, MAX_MESSAGE_LENGTH);
 
     /* ---------- SAFE HISTORY ---------- */
+    // ✅ FIX #2: نحسب الـ total chars ونوقف لو تجاوزنا الحد
+    let totalChars = 0;
     const conversationHistory = Array.isArray(history)
       ? history
-          .slice(-10)
+          .slice(-MAX_HISTORY_MESSAGES)
           .filter(
             (m: any) =>
               m &&
@@ -83,17 +195,21 @@ export async function POST(req: Request) {
           )
           .map((m: any) => ({
             role: m.role,
-            content: m.content.slice(0, 1500),
+            content: m.content.slice(0, MAX_HISTORY_CONTENT_LENGTH),
           }))
+          .filter((m) => {
+            totalChars += m.content.length;
+            return totalChars <= MAX_TOTAL_HISTORY_CHARS;
+          })
       : [];
 
     /* ---------- OPENAI CALL ---------- */
     const completion = await openai.chat.completions.create({
       model: "gpt-4o-mini",
       messages: [
-        { role: "system", content: SYSTEM_PROMPT },
+        { role: "system", content: buildSystemPrompt() },
         ...conversationHistory,
-        { role: "user", content: sanitizedMessage }
+        { role: "user", content: sanitizedMessage },
       ],
       temperature: 0.7,
       max_tokens: 700,
@@ -103,13 +219,11 @@ export async function POST(req: Request) {
     });
 
     /* ---------- EXTRACT REPLY ---------- */
-    const reply =
-      completion.choices?.[0]?.message?.content?.trim() ||
-      null;
+    const reply = completion.choices?.[0]?.message?.content?.trim() || null;
 
     if (!reply) {
       return NextResponse.json(
-        { reply: "Unable to generate response. Please try again." },
+        { reply: getErrorMsg("noReply", lang) },
         { status: 500 }
       );
     }
@@ -119,25 +233,27 @@ export async function POST(req: Request) {
   } catch (error: any) {
     console.error("LEO AI ERROR:", error?.message || error);
 
-    /* ---------- KNOWN ERRORS ---------- */
+    const lang = "en"; // fallback للـ catch لأننا ما عندنا access للـ message
 
+    /* ---------- KNOWN ERRORS ---------- */
     if (error?.status === 401) {
       return NextResponse.json(
-        { reply: "Authentication error." },
+        { reply: getErrorMsg("auth", lang) },
         { status: 401 }
       );
     }
 
     if (error?.status === 429) {
       return NextResponse.json(
-        { reply: "Too many requests. Please slow down." },
+        { reply: getErrorMsg("tooManyRequests", lang) },
         { status: 429 }
       );
     }
 
-    if (error?.status >= 500) {
+    // ✅ FIX #4: typeof check عشان ما نقع بمشكلة undefined >= 500
+    if (typeof error?.status === "number" && error.status >= 500) {
       return NextResponse.json(
-        { reply: "AI service temporarily unavailable." },
+        { reply: getErrorMsg("serviceUnavailable", lang) },
         { status: 503 }
       );
     }
@@ -149,14 +265,14 @@ export async function POST(req: Request) {
       error?.code === "ETIMEDOUT"
     ) {
       return NextResponse.json(
-        { reply: "Network connection issue." },
+        { reply: getErrorMsg("network", lang) },
         { status: 503 }
       );
     }
 
     /* ---------- FALLBACK ---------- */
     return NextResponse.json(
-      { reply: "Unexpected server error." },
+      { reply: getErrorMsg("unexpected", lang) },
       { status: 500 }
     );
   }
