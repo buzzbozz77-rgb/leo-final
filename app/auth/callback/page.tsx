@@ -2,7 +2,8 @@
 
 import { useEffect } from "react";
 import { useRouter } from "next/navigation";
-import { supabase } from '@/app/lib/supabase'
+import { supabase } from "../../lib/supabase";
+
 /**
  * This page lives at /auth/callback
  * Supabase redirects here after Google / Apple OAuth.
@@ -13,7 +14,6 @@ export default function AuthCallbackPage() {
 
   useEffect(() => {
     const handle = async () => {
-      // exchangeCodeForSession picks up the ?code= param automatically
       const { error } = await supabase.auth.exchangeCodeForSession(
         window.location.href,
       );
@@ -24,7 +24,6 @@ export default function AuthCallbackPage() {
         return;
       }
 
-      // Check if this user already has a display_name / username set
       const { data: { user } } = await supabase.auth.getUser();
 
       if (user) {
@@ -34,7 +33,6 @@ export default function AuthCallbackPage() {
           .eq("id", user.id)
           .single();
 
-        // New OAuth user — no username yet → let them pick one
         if (!profile?.display_name) {
           router.replace("/?pick_username=true");
           return;
@@ -59,7 +57,6 @@ export default function AuthCallbackPage() {
         gap: "16px",
       }}
     >
-      {/* Spinner */}
       <span
         style={{
           width: "36px",
