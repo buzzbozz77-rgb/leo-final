@@ -2,8 +2,7 @@
 
 import { useEffect } from "react";
 import { useRouter } from "next/navigation";
-import { supabase } from "../lib/supabase";
-
+import { supabase } from '@/app/lib/supabase'
 /**
  * This page lives at /auth/callback
  * Supabase redirects here after Google / Apple OAuth.
