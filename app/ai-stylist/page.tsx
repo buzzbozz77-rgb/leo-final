@@ -713,7 +713,7 @@ export default function AIStylistPage() {
     setAnalysisLoading(true); setAnalysisResult(null); setAnalysisError(null);
     try {
       const base64 = await compressImage(analysisImage);
-      const { data: sessionData } = await (await import("../lib/supabase")).supabase.auth.getSession();
+      const { data: sessionData } = await (await import("@/app/lib/supabase")).supabase.auth.getSession();
       const accessToken = sessionData?.session?.access_token ?? null;
       const res = await fetch("/api/analyze-outfit", {
         method: "POST",
